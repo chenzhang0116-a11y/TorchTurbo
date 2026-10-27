@@ -827,7 +827,9 @@ class TorchTurboEngine:
 
         # profiling_config knobs are only meaningful when profiling is enabled.
         knobs = profiling_config if profiling_enabled else None
-        record_shapes = bool(knobs and knobs.get("with_shape", False))
+        detailed_kernel_info = bool(
+            knobs and knobs.get("detailed_kernel_info", False)
+        )
         with_stack = bool(knobs and knobs.get("with_stack", False))
 
         profiling_dir = os.path.join(output_dir, "profiling")
@@ -854,7 +856,8 @@ class TorchTurboEngine:
             output_dir=profiling_dir,
             worker_name=f"rank{rank}_{socket.gethostname()}",
             profiling_enabled=profiling_enabled,
-            record_shapes=record_shapes,
+            record_shapes=detailed_kernel_info,
+            aic_metrics=detailed_kernel_info,
             with_stack=with_stack,
             memory_snapshot_steps=memory_snapshot_steps,
         )
@@ -863,10 +866,11 @@ class TorchTurboEngine:
 
         if profiling_enabled:
             logger.info_rank0("Profiling started, output dir: %s", profiling_dir)
-            if record_shapes or with_stack:
+            if detailed_kernel_info or with_stack:
                 logger.info_rank0(
-                    "Profiling detail knobs: record_shapes=%s, with_stack=%s",
-                    record_shapes,
+                    "Profiling detail knobs: detailed_kernel_info=%s, "
+                    "with_stack=%s",
+                    detailed_kernel_info,
                     with_stack,
                 )
         if memory_snapshot_enabled:

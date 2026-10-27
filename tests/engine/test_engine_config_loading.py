@@ -134,7 +134,7 @@ def test_parse_runtime_flags_excluded_from_overrides():
             "cfg.yaml",
             "--tt_profiling",
             "--tt_profiling_config",
-            '{"with_shape": true, "with_stack": true}',
+            '{"detailed_kernel_info": true, "with_stack": true}',
             "--tt_log_level",
             "DEBUG",
             "--tt_memory_snapshot_steps",
@@ -145,7 +145,7 @@ def test_parse_runtime_flags_excluded_from_overrides():
     )
 
     assert tt.config_overrides == {"tt_ep_size": 4}
-    assert tt.profiling_config == {"with_shape": True, "with_stack": True}
+    assert tt.profiling_config == {"detailed_kernel_info": True, "with_stack": True}
 
 
 def test_parse_explicit_default_value_still_an_override():

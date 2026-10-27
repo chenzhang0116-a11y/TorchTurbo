@@ -376,8 +376,9 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 
 `--tt_profiling` profiles one step into `{output_dir}/profiling/`. Add
 `--tt_profiling_config` to collect extra details (a JSON dict; quote it in the
-shell so it survives as one token): `{"with_shape": true}` records tensor
-shapes (operator- and kernel-level; raises the NPU profiler level to Level1) and
+shell so it survives as one token): `{"detailed_kernel_info": true}` records
+kernel-level input shapes and AiCore utilization metrics in
+`kernel_details.csv` (raises the NPU profiler level to Level1) and
 `{"with_stack": true}` records the Python call stack. Both default to false and
 only take effect together with `--tt_profiling`.
 

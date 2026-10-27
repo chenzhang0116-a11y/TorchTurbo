@@ -15,9 +15,12 @@ class _CudaProfiler(BaseProfiler):
         worker_name: str,
         profiling_enabled: bool,
         record_shapes: bool,
+        aic_metrics: bool,
         with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> None:
+        # aic_metrics is NPU-only; CUDA has no equivalent knob.
+        del aic_metrics
         self._profiler = None
         if profiling_enabled:
             self._profiler = torch.profiler.profile(
@@ -140,6 +143,7 @@ class CudaRuntime(DeviceRuntime):
         worker_name: str,
         profiling_enabled: bool,
         record_shapes: bool,
+        aic_metrics: bool,
         with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
@@ -148,6 +152,7 @@ class CudaRuntime(DeviceRuntime):
             worker_name,
             profiling_enabled,
             record_shapes,
+            aic_metrics,
             with_stack,
             memory_snapshot_steps,
         )

@@ -80,6 +80,7 @@ class FakeRuntime(DeviceRuntime):
         worker_name: str,
         profiling_enabled: bool,
         record_shapes: bool,
+        aic_metrics: bool,
         with_stack: bool,
         memory_snapshot_steps: int | None,
     ):
@@ -130,6 +131,7 @@ def test_cpu_runtime_contract():
             worker_name="worker",
             profiling_enabled=True,
             record_shapes=False,
+            aic_metrics=False,
             with_stack=False,
             memory_snapshot_steps=None,
         )
@@ -301,7 +303,7 @@ def _fake_torch_npu_module():
         _ExperimentalConfig=FakeExperimentalConfig,
         ExportType=SimpleNamespace(Text="text"),
         ProfilerLevel=SimpleNamespace(Level0="Level0", Level1="Level1"),
-        AiCMetrics=SimpleNamespace(AiCoreNone="none"),
+        AiCMetrics=SimpleNamespace(AiCoreNone="none", PipeUtilization="pipe"),
         ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
         schedule=lambda **kwargs: None,
         tensorboard_trace_handler=lambda *args, **kwargs: None,
@@ -312,11 +314,16 @@ def _fake_torch_npu_module():
 
 
 @pytest.mark.parametrize(
-    ("record_shapes", "with_stack", "expected_level"),
-    [(True, False, "Level1"), (False, True, "Level0")],
+    ("record_shapes", "with_stack", "expected_level", "expected_aic"),
+    [
+        # detailed_kernel_info raises the level and turns on utilization.
+        (True, False, "Level1", "pipe"),
+        # with_stack must not raise the level or enable metrics.
+        (False, True, "Level0", "none"),
+    ],
 )
-def test_npu_profiler_level_follows_record_shapes(
-    monkeypatch, record_shapes, with_stack, expected_level
+def test_npu_profiler_level_and_aic_metrics(
+    monkeypatch, record_shapes, with_stack, expected_level, expected_aic
 ):
     fake_module, experimental_config_calls, profile_calls = (
         _fake_torch_npu_module()
@@ -330,13 +337,14 @@ def test_npu_profiler_level_follows_record_shapes(
         "rank0",
         profiling_enabled=True,
         record_shapes=record_shapes,
+        aic_metrics=record_shapes,
         with_stack=with_stack,
         memory_snapshot_steps=None,
     )
     # Constructing records torch_npu calls; start() is never called so this
-    # test works on devices without torch_npu installed.
-    # Level only tracks record_shapes; with_stack must not raise it.
+    # test works on machines without torch_npu installed.
     assert profiler._profiler is not None
     assert experimental_config_calls[0]["profiler_level"] == expected_level
+    assert experimental_config_calls[0]["aic_metrics"] == expected_aic
     assert profile_calls[0]["record_shapes"] is record_shapes
     assert profile_calls[0]["with_stack"] is with_stack

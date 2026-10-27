@@ -73,6 +73,7 @@ class CpuRuntime(DeviceRuntime):
         worker_name: str,
         profiling_enabled: bool,
         record_shapes: bool,
+        aic_metrics: bool,
         with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:

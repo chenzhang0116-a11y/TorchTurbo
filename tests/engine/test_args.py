@@ -247,12 +247,12 @@ def test_parse_torchturbo_args_profiling():
         [
             "--tt_profiling",
             "--tt_profiling_config",
-            '{"with_shape": true}',
+            '{"detailed_kernel_info": true}',
             "--other",
         ]
     )
     assert args.profiling is True
-    assert args.profiling_config == {"with_shape": True}
+    assert args.profiling_config == {"detailed_kernel_info": True}
     # Non-tt args stay in remaining for the training framework parser.
     assert remaining == ["--other"]
 
@@ -261,6 +261,10 @@ def test_parse_torchturbo_args_profiling():
     assert args.profiling is False
     assert args.profiling_config == {"with_stack": True}
 
-    for invalid in ("bogus", '{"bad": true}', '{"with_shape": "yes"}'):
+    for invalid in (
+        "bogus",
+        '{"bad": true}',
+        '{"detailed_kernel_info": "yes"}',
+    ):
         with pytest.raises(SystemExit, match="2"):
             parse_torchturbo_args(["--tt_profiling_config", invalid])

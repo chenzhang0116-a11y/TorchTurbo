@@ -38,6 +38,7 @@ class _NpuProfiler(BaseProfiler):
         worker_name: str,
         profiling_enabled: bool,
         record_shapes: bool,
+        aic_metrics: bool,
         with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> None:
@@ -45,17 +46,24 @@ class _NpuProfiler(BaseProfiler):
         if profiling_enabled:
             import torch_npu
 
-            # Level0 omits input shapes from kernel_details.csv; Level1 emits them.
+            # Level0 omits input shapes from kernel_details.csv and drops the
+            # AiCore utilization columns; Level1 emits both. aic_metrics needs
+            # a non-None value for the utilization counters to be collected.
+            detailed_kernel_info = record_shapes or aic_metrics
             profiler_level = (
                 torch_npu.profiler.ProfilerLevel.Level1
-                if record_shapes
+                if detailed_kernel_info
                 else torch_npu.profiler.ProfilerLevel.Level0
             )
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=[torch_npu.profiler.ExportType.Text],
                 profiler_level=profiler_level,
                 mstx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                aic_metrics=(
+                    torch_npu.profiler.AiCMetrics.PipeUtilization
+                    if aic_metrics
+                    else torch_npu.profiler.AiCMetrics.AiCoreNone
+                ),
                 l2_cache=False,
                 op_attr=False,
                 data_simplification=False,
@@ -209,6 +217,7 @@ class NpuRuntime(DeviceRuntime):
         worker_name: str,
         profiling_enabled: bool,
         record_shapes: bool,
+        aic_metrics: bool,
         with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
@@ -217,6 +226,7 @@ class NpuRuntime(DeviceRuntime):
             worker_name,
             profiling_enabled,
             record_shapes,
+            aic_metrics,
             with_stack,
             memory_snapshot_steps,
         )

@@ -389,12 +389,12 @@ def test_train_checks_the_output_dir_before_training(
         # Profiling on: the config dict is forwarded as the trailing argument.
         (
             True,
-            {"with_shape": True},
-            (True, None, {"with_shape": True}),
+            {"detailed_kernel_info": True},
+            (True, None, {"detailed_kernel_info": True}),
             True,
         ),
         # Config without --tt_profiling stays inert.
-        (False, {"with_shape": True}, None, False),
+        (False, {"detailed_kernel_info": True}, None, False),
     ],
 )
 def test_train_forwards_profiling_config(

@@ -51,13 +51,14 @@ def parse_log_level(value: str) -> LogLevel:
 def parse_profiling_config(value: str) -> dict[str, bool]:
     """Parse a --tt_profiling_config JSON dict of profiling detail knobs.
 
-    Accepted keys are ``with_shape`` and ``with_stack``; both must be bool.
+    Accepted keys are ``detailed_kernel_info`` and ``with_stack``; both must
+    be bool.
     """
     try:
         parsed = json.loads(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"Invalid JSON: {value!r}") from exc
-    unknown = set(parsed) - {"with_shape", "with_stack"}
+    unknown = set(parsed) - {"detailed_kernel_info", "with_stack"}
     if unknown:
         raise argparse.ArgumentTypeError(
             f"Unknown profiling keys: {sorted(unknown)}"
@@ -177,8 +178,8 @@ class TorchTurboArgs:
         Whether to export HF safetensors with the final training checkpoint
         or every training checkpoint. Defaults to every checkpoint.
     profiling_config:
-        Profiling detail knobs (``with_shape``/``with_stack``) as a JSON
-        dict from ``--tt_profiling_config``. Only effective when
+        Profiling detail knobs (``detailed_kernel_info``/``with_stack``) as
+        a JSON dict from ``--tt_profiling_config``. Only effective when
         ``profiling`` is enabled. ``None`` means both knobs are off.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
@@ -687,9 +688,11 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         type=parse_profiling_config,
         metavar="DICT",
         help="Profiling detail knobs as a JSON dict. Only effective with "
-        "--tt_profiling. with_shape records tensor shapes (enables "
-        "record_shapes and NPU profiler level Level1); with_stack records "
-        'the Python call stack. E.g. {"with_shape": true}.',
+        "--tt_profiling. detailed_kernel_info records kernel-level input "
+        "shapes and AiCore utilization metrics (enables record_shapes, "
+        "aic_metrics=PipeUtilization, and NPU profiler level Level1); "
+        'with_stack records the Python call stack. '
+        'E.g. {"detailed_kernel_info": true}.',
     ),
     TurboArgSpec(
         name="memory_snapshot_steps",
