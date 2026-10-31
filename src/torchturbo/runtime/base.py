@@ -16,6 +16,7 @@ class BaseProfiler(ABC):
         record_shapes: bool,
         aic_metrics: bool,
         with_stack: bool,
+        profiling_step: int | None,
         memory_snapshot_steps: int | None,
     ) -> None:
         ...
@@ -139,6 +140,7 @@ class DeviceRuntime(ABC):
         record_shapes: bool,
         aic_metrics: bool,
         with_stack: bool,
+        profiling_step: int | None,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         ...

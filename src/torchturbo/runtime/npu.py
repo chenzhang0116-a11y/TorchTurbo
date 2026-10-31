@@ -40,6 +40,7 @@ class _NpuProfiler(BaseProfiler):
         record_shapes: bool,
         aic_metrics: bool,
         with_stack: bool,
+        profiling_step: int | None,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
@@ -66,18 +67,24 @@ class _NpuProfiler(BaseProfiler):
                 ),
                 l2_cache=False,
                 op_attr=False,
-                data_simplification=False,
+                data_simplification=True,
                 record_op_args=False,
                 gc_detect_threshold=None,
             )
 
+            # Training step N (1-based) runs inside the ProfilerStep#(N-1)
+            # record_function window, so profiling_step=N maps to
+            # skip_first=N-1. With no profiling_step, default to step 1.
+            skip_first = (
+                profiling_step - 1 if profiling_step is not None else 0
+            )
             self._profiler = torch_npu.profiler.profile(
                 activities=[
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
                 schedule=torch_npu.profiler.schedule(
-                    wait=0, warmup=10, active=1, repeat=1, skip_first=1
+                    wait=0, warmup=0, active=1, repeat=1, skip_first=skip_first
                 ),
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
@@ -219,6 +226,7 @@ class NpuRuntime(DeviceRuntime):
         record_shapes: bool,
         aic_metrics: bool,
         with_stack: bool,
+        profiling_step: int | None,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _NpuProfiler(
@@ -228,5 +236,6 @@ class NpuRuntime(DeviceRuntime):
             record_shapes,
             aic_metrics,
             with_stack,
+            profiling_step,
             memory_snapshot_steps,
         )

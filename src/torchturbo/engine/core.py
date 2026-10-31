@@ -815,7 +815,7 @@ class TorchTurboEngine:
         output_dir: str,
         profiling_enabled: bool,
         memory_snapshot_steps: int | None,
-        profiling_config: dict[str, bool] | None = None,
+        profiling_config: dict[str, bool | int] | None = None,
     ) -> None:
         """Start TorchTurbo profiling under ``output_dir``."""
         if memory_snapshot_steps is not None and memory_snapshot_steps < 1:
@@ -831,6 +831,9 @@ class TorchTurboEngine:
             knobs and knobs.get("detailed_kernel_info", False)
         )
         with_stack = bool(knobs and knobs.get("with_stack", False))
+        profiling_step = (
+            knobs.get("profiling_step") if knobs is not None else None
+        )
 
         profiling_dir = os.path.join(output_dir, "profiling")
         if profiling_enabled:
@@ -859,6 +862,7 @@ class TorchTurboEngine:
             record_shapes=detailed_kernel_info,
             aic_metrics=detailed_kernel_info,
             with_stack=with_stack,
+            profiling_step=profiling_step,
             memory_snapshot_steps=memory_snapshot_steps,
         )
         profiler.start()
@@ -866,12 +870,13 @@ class TorchTurboEngine:
 
         if profiling_enabled:
             logger.info_rank0("Profiling started, output dir: %s", profiling_dir)
-            if detailed_kernel_info or with_stack:
+            if detailed_kernel_info or with_stack or profiling_step is not None:
                 logger.info_rank0(
                     "Profiling detail knobs: detailed_kernel_info=%s, "
-                    "with_stack=%s",
+                    "with_stack=%s, profiling_step=%s",
                     detailed_kernel_info,
                     with_stack,
+                    profiling_step,
                 )
         if memory_snapshot_enabled:
             logger.info_rank0(

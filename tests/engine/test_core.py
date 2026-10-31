@@ -995,6 +995,7 @@ class TestEngineSetup:
             record_shapes: bool,
             aic_metrics: bool,
             with_stack: bool,
+            profiling_step: int | None,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["output_dir"] = output_dir
@@ -1003,6 +1004,7 @@ class TestEngineSetup:
             profiler_kwargs["record_shapes"] = record_shapes
             profiler_kwargs["aic_metrics"] = aic_metrics
             profiler_kwargs["with_stack"] = with_stack
+            profiler_kwargs["profiling_step"] = profiling_step
             return profiler
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1025,6 +1027,7 @@ class TestEngineSetup:
         assert profiler_kwargs["record_shapes"] is False
         assert profiler_kwargs["aic_metrics"] is False
         assert profiler_kwargs["with_stack"] is False
+        assert profiler_kwargs["profiling_step"] is None
         assert (tmp_path / "profiling").is_dir()
 
     def test_profiling_config_knobs_reach_runtime_profiler(
@@ -1042,12 +1045,14 @@ class TestEngineSetup:
             record_shapes: bool,
             aic_metrics: bool,
             with_stack: bool,
+            profiling_step: int | None,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["profiling_enabled"] = profiling_enabled
             profiler_kwargs["record_shapes"] = record_shapes
             profiler_kwargs["aic_metrics"] = aic_metrics
             profiler_kwargs["with_stack"] = with_stack
+            profiler_kwargs["profiling_step"] = profiling_step
             return recorder
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1067,6 +1072,12 @@ class TestEngineSetup:
         assert profiler_kwargs["record_shapes"] is True
         assert profiler_kwargs["aic_metrics"] is True
         assert profiler_kwargs["with_stack"] is False
+        assert profiler_kwargs["profiling_step"] is None
+
+        engine.start_profiling(
+            str(tmp_path), True, None, {"profiling_step": 20}
+        )
+        assert profiler_kwargs["profiling_step"] == 20
 
         engine.start_profiling(str(tmp_path), True, None, {"with_stack": True})
         assert profiler_kwargs["record_shapes"] is False
@@ -1078,6 +1089,7 @@ class TestEngineSetup:
         assert profiler_kwargs["record_shapes"] is False
         assert profiler_kwargs["aic_metrics"] is False
         assert profiler_kwargs["with_stack"] is False
+        assert profiler_kwargs["profiling_step"] is None
 
     def test_profiling_start_failure_clears_previous_profiler(
         self, monkeypatch, tmp_path
@@ -1101,6 +1113,7 @@ class TestEngineSetup:
             record_shapes: bool,
             aic_metrics: bool,
             with_stack: bool,
+            profiling_step: int | None,
             memory_snapshot_steps: int | None,
         ):
             # Failure-path test: kwargs are irrelevant.
@@ -1111,6 +1124,7 @@ class TestEngineSetup:
                 record_shapes,
                 aic_metrics,
                 with_stack,
+                profiling_step,
                 memory_snapshot_steps,
             )
             return next(profilers)
