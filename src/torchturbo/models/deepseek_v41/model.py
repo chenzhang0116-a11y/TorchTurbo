@@ -9,7 +9,11 @@ from ..base import ParameterGroup, TurboVLMModel
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
 from .configuration_deepseek_v41 import DeepseekV41Config
-from .modeling_deepseek_v41 import DeepseekV41ForCausalLM, HostOffloadEngram
+from .modeling_deepseek_v41 import (
+    DeepseekV41ForCausalLM,
+    DeepseekV41Indexer,
+    HostOffloadEngram,
+)
 
 
 class DeepseekV41WeightConverter(BaseWeightConverter):
@@ -60,6 +64,10 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         super().__init__(config)
         self._post_init_patches()
         self._model_path = None
+        # Top-k indices do not carry grad into the indexer. Freeze before
+        # sharding so those weights stay out of the optimizer; on_materialized
+        # repeats this after assign-style checkpoint loading.
+        self._freeze_indexers()
 
     @classmethod
     def get_default_parallel_plan(cls, **kwargs):
@@ -90,6 +98,20 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
             type(self).forward,
             sliced_inputs=(("input_ids", 1), ("position_ids", -1)),
         )
+
+    def on_parallelized(self, parallel_context):
+        sp_size = parallel_context["sp"]["sp_size"]
+        if sp_size != 1:
+            raise NotImplementedError(
+                "DeepSeek V4.1 sequence parallelism is not implemented "
+                f"(got sp_size={sp_size}). The first SFT path requires sp_size=1."
+            )
+
+    def _freeze_indexers(self):
+        for module in self.modules():
+            if isinstance(module, DeepseekV41Indexer):
+                for param in module.parameters():
+                    param.requires_grad_(False)
 
     def get_parameter_groups(self):
         groups = super().get_parameter_groups()
@@ -178,7 +200,9 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
                     module.load_params(self._model_path, device)
                 else:
                     module.embed.init_rows_random()
-                    module.init_params_random()
+                    module.init_params_random(device)
                 module.embed.freeze()
                 if self.engram_hash is not None:
                     module.embed.hash_fingerprint = self.engram_hash.hash_fingerprint
+        # Checkpoint assign can replace parameters and restore requires_grad.
+        self._freeze_indexers()

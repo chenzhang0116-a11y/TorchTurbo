@@ -1150,6 +1150,23 @@ class HostOffloadEngram(DeepseekV41Engram):
         self.embed.shard_(group)
         return self
 
+    def _materialize_param(self, module, name, device):
+        """Replace a meta parameter with an empty real tensor.
+
+        The weight converter skips every ``.engram.`` key, and this module is
+        ``no_shard``, so wkv/q/k stay meta until here. ``copy_`` cannot write
+        into a meta parameter.
+        """
+        param = getattr(module, name)
+        if not param.is_meta:
+            return param
+        real = nn.Parameter(
+            torch.empty(param.shape, dtype=param.dtype, device=device),
+            requires_grad=param.requires_grad,
+        )
+        setattr(module, name, real)
+        return real
+
     def load_params(self, model_path: str, device=None):
         """Load wkv/q_weight/k_weight straight from their checkpoint shard.
 
@@ -1165,24 +1182,36 @@ class HostOffloadEngram(DeepseekV41Engram):
         index_path = Path(model_path) / "model.safetensors.index.json"
         with open(index_path) as f:
             weight_map = json.load(f)["weight_map"]
-        targets = {
-            "wkv.weight": self.wkv.weight,
-            "q_weight": self.q_weight,
-            "k_weight": self.k_weight,
-        }
+        specs = (
+            ("wkv.weight", self.wkv, "weight"),
+            ("q_weight", self, "q_weight"),
+            ("k_weight", self, "k_weight"),
+        )
         by_file: dict = {}
-        for suffix, param in targets.items():
+        for suffix, module, name in specs:
             key = f"layers.{self.layer_idx}.engram.{suffix}"
-            by_file.setdefault(weight_map[key], []).append((key, param))
+            by_file.setdefault(weight_map[key], []).append((key, module, name))
         for filename, items in by_file.items():
             with safe_open(Path(model_path) / filename, framework="pt") as f:
-                for key, param in items:
+                for key, module, name in items:
+                    param = self._materialize_param(module, name, device)
                     param.data.copy_(
                         f.get_tensor(key).to(device=param.device, dtype=param.dtype)
                     )
 
-    def init_params_random(self):
+    def init_params_random(self, device=None):
         """Fallback for train-from-scratch runs without a checkpoint."""
+        needs_storage = (
+            self.wkv.weight.is_meta or self.q_weight.is_meta or self.k_weight.is_meta
+        )
+        if needs_storage and device is None:
+            from torchturbo.runtime import get_device_runtime
+
+            device = get_device_runtime().device
+        if needs_storage:
+            self._materialize_param(self.wkv, "weight", device)
+            self._materialize_param(self, "q_weight", device)
+            self._materialize_param(self, "k_weight", device)
         nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=0.02)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
@@ -1278,6 +1307,8 @@ class DeepseekV41MoE(nn.Module):
 
     def __init__(self, text_config, layer_idx: int, vision_enabled: bool):
         super().__init__()
+        # parallel_plan reads this to pick the per-layer swiglu clamp.
+        self.layer_idx = layer_idx
         self.dim = text_config.hidden_size
         self.n_routed_experts = text_config.n_routed_experts
         self.gate = DeepseekV41Gate(text_config, vision_enabled)
