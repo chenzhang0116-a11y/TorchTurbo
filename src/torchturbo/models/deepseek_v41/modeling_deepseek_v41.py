@@ -576,6 +576,22 @@ class DeepseekV41PreAttentionOps(nn.Module):
         return q, kv, window_topk, compress_kv, new_topk
 
 
+def _select_kv_rows(kv_states: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Pick KV rows by index without materializing ``[b, seq, kv_len, dim]``.
+
+    ``kv_states`` is ``[b, kv_len, dim]`` and ``indices`` is ``[b, seq, topk]``
+    (already clamped to ``>= 0``). ``torch.gather`` on an expanded KV makes
+    NPU allocate the full broadcast, which is larger than one die at 4k.
+    ``index_select`` only writes the selected rows, ``[b, seq, topk, dim]``.
+    """
+    bsz, seqlen, topk = indices.shape
+    kv_len, head_dim = kv_states.shape[1], kv_states.shape[-1]
+    offsets = torch.arange(bsz, device=indices.device, dtype=indices.dtype)
+    flat_index = (indices + offsets.view(bsz, 1, 1) * kv_len).reshape(-1)
+    rows = kv_states.contiguous().view(bsz * kv_len, head_dim)
+    return rows.index_select(0, flat_index).view(bsz, seqlen, topk, head_dim)
+
+
 class DeepseekV41InnerAttentionOps(nn.Module):
     """Indexed sparse attention over the selected KV positions.
 
@@ -613,15 +629,9 @@ class DeepseekV41InnerAttentionOps(nn.Module):
             topk_idxs = window_topk
             kv_states = kv
 
-        bsz, seqlen, n_heads, head_dim = q.shape
-        topk_size = topk_idxs.shape[-1]
+        bsz, seqlen = q.shape[:2]
         safe_indices = topk_idxs.clamp_min(0).long()
-        expanded_kv = kv_states.unsqueeze(1).expand(-1, seqlen, -1, -1)
-        selected_kv = torch.gather(
-            expanded_kv,
-            2,
-            safe_indices.unsqueeze(-1).expand(bsz, seqlen, topk_size, head_dim),
-        )
+        selected_kv = _select_kv_rows(kv_states, safe_indices)
 
         scores = (
             torch.einsum("bshd,bskd->bshk", q, selected_kv).float() * self.softmax_scale
