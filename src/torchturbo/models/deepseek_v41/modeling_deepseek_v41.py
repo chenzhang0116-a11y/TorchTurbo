@@ -483,9 +483,12 @@ class DeepseekV41Indexer(nn.Module):
             )
         idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
 
+        # Flatten before gathering. idxs is [b, s, k]; a [b, 1] batch index
+        # only broadcasts against that when b == 1. b > 1 collides s with b.
+        flat_idxs = idxs.reshape(bsz, -1)
         batch_index = torch.arange(bsz, device=x.device).unsqueeze(1)
-        topk_ids = block_ids[batch_index, idxs]
-        topk_pos = block_positions[batch_index, idxs]
+        topk_ids = block_ids[batch_index, flat_idxs].view_as(idxs)
+        topk_pos = block_positions[batch_index, flat_idxs].view_as(idxs)
         invalid = pu.packed_compress_mask(
             attention_mask, topk_ids, topk_pos, self.compress_ratio, position_ids
         )

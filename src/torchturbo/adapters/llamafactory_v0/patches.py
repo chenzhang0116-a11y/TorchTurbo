@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Version range for LlamaFactory v0
-_LF_V0 = "==0.9.5"
+# Version range for LlamaFactory v0. bailing_v3_vl_sft_t58 reports
+# 0.9.4.dev0; the 0.9.5 pin skipped every patch.
+_LF_V0 = ">=0.9.4.dev0,<1.0"
 
 # ---------------------------------------------------------------------------
 # DictFieldPatch — fix dict-typed CLI args in HfArgumentParser
@@ -667,11 +668,15 @@ class CreateRefModelPatch(BasePatch):
             _patched_create_ref_model,
             required=True,
         )
-        self._replace_create_ref_model(
-            "llamafactory.train.dpo.workflow",
-            _patched_create_ref_model,
-            required=getattr(self.adapter, "stage", None) == "dpo",
-        )
+        # Importing dpo.workflow pulls trl.DPOTrainer. The installed trl still
+        # references MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES, which transformers 5
+        # removed. SFT does not need that import.
+        if getattr(self.adapter, "stage", None) == "dpo":
+            self._replace_create_ref_model(
+                "llamafactory.train.dpo.workflow",
+                _patched_create_ref_model,
+                required=True,
+            )
 
     def _replace_create_ref_model(
         self,
@@ -741,7 +746,8 @@ class TrainerClassPatch(BasePatch):
     def patch(self, engine: TorchTurboEngine) -> None:
         self._patch_sft(engine)
         self._patch_pt(engine)
-        self._patch_dpo(engine)
+        if getattr(self.adapter, "stage", None) == "dpo":
+            self._patch_dpo(engine)
 
     def _replace(self, module: Any, attr_name: str, patched_cls: type) -> None:
         from .trainer import unwrap_torchturbo_trainer_class

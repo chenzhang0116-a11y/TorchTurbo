@@ -106,6 +106,32 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
                 "DeepSeek V4.1 sequence parallelism is not implemented "
                 f"(got sp_size={sp_size}). The first SFT path requires sp_size=1."
             )
+        # publish_shared runs outside decoder_layer.forward, so FSDP2's
+        # forward pre-hook never all-gathers that layer. Register it as a
+        # forward method or the first RMSNorm sees a DTensor weight.
+        self._register_publish_shared_for_fsdp()
+
+    def _register_publish_shared_for_fsdp(self):
+        layers = getattr(self, "layers", None)
+        if not layers:
+            return
+        try:
+            from torch.distributed.fsdp._fully_shard import (
+                FSDPModule,
+                register_fsdp_forward_method,
+            )
+        except ImportError:
+            from torch.distributed._composable.fsdp.fully_shard import (
+                FSDPModule,
+                register_fsdp_forward_method,
+            )
+        for layer in layers:
+            if not isinstance(layer, FSDPModule):
+                continue
+            if getattr(layer, "_tt_publish_shared_fsdp_registered", False):
+                continue
+            register_fsdp_forward_method(layer, "publish_shared")
+            layer._tt_publish_shared_fsdp_registered = True
 
     def _freeze_indexers(self):
         for module in self.modules():

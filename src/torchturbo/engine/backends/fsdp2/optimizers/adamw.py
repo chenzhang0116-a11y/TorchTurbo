@@ -426,40 +426,26 @@ class AdamWSwapMixin:
             index = next_index
 
     def _step_on_host(self, params_with_groups) -> None:
-        for _, group_entries in groupby(
-            params_with_groups, key=lambda entry: id(entry[1])
-        ):
-            batch = list(group_entries)
-            group = batch[0][1]
-            local_params = [
-                param.to_local() if isinstance(param, DTensor) else param
-                for param, _ in batch
-            ]
-            local_grads = [
+        # One parameter at a time. Pinning a whole FSDP group of params and
+        # grads overflows rtMallocHost when every local rank shares one host.
+        for param, group in params_with_groups:
+            local_param = param.to_local() if isinstance(param, DTensor) else param
+            local_grad = (
                 param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-                for param, _ in batch
-            ]
-            cpu_params = [
-                torch.empty_like(param, device="cpu", pin_memory=True)
-                for param in local_params
-            ]
-            cpu_grads = [
-                torch.empty_like(grad, device="cpu", pin_memory=True)
-                for grad in local_grads
-            ]
-            for cpu_param, local_param in zip(cpu_params, local_params):
-                cpu_param.copy_(local_param.detach())
-            for cpu_grad, local_grad in zip(cpu_grads, local_grads):
-                cpu_grad.copy_(local_grad)
+            )
+            cpu_param = torch.empty_like(local_param, device="cpu", pin_memory=True)
+            cpu_grad = torch.empty_like(local_grad, device="cpu", pin_memory=True)
+            cpu_param.copy_(local_param.detach())
+            cpu_grad.copy_(local_grad)
             self._run_adamw(
-                cpu_params,
-                cpu_grads,
-                [self.param_to_cpu_states_map[param] for param, _ in batch],
-                [self.param_to_step_map[param] for param, _ in batch],
+                [cpu_param],
+                [cpu_grad],
+                [self.param_to_cpu_states_map[param]],
+                [self.param_to_step_map[param]],
                 group,
             )
-            for local_param, cpu_param in zip(local_params, cpu_params):
-                local_param.copy_(cpu_param)
+            local_param.copy_(cpu_param)
+            del cpu_param, cpu_grad
 
 
 class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
