@@ -251,6 +251,14 @@ class DeepseekV41Config(PretrainedConfig):
         return self.vision_config.num_hidden_layers > 0
 
     @property
+    def use_cache(self):
+        return self.text_config.use_cache
+
+    @use_cache.setter
+    def use_cache(self, value):
+        self.text_config.use_cache = value
+
+    @property
     def num_nextn_predict_layers(self):
         return self.text_config.num_nextn_predict_layers
 

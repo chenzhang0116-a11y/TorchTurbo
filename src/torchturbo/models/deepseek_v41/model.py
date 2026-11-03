@@ -38,6 +38,15 @@ class DeepseekV41WeightConverter(BaseWeightConverter):
     def get_hf_gate_bias_name(self):
         return "gate.bias"
 
+    def get_param_load_entries(self, name, numel, param_to_filename=None):
+        # Engram params sit in the 197GiB table shards; loading them through
+        # the generic path would materialize whole shards on the host.
+        # RowShardedEngram loads them itself in on_materialized (the parallel
+        # plan always swaps the engram modules on the engine path).
+        if ".engram." in name:
+            return [], None, {}
+        return super().get_param_load_entries(name, numel, param_to_filename)
+
 
 @register_model(
     "deepseek_v41", config_cls=DeepseekV41Config, auto_class=AutoModelForCausalLM
@@ -150,8 +159,9 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         """Build engram runtime state after parameters are on a real device.
 
         The n-gram hash buffers need the tokenizer; the row-sharded engram
-        tables are read straight from the checkpoint shards (they are not
-        parameters, so the generic loader never sees them).
+        tables AND their sibling params are read straight from the checkpoint
+        shards (the params share the 197GiB table files, so the generic
+        loader skips them entirely - see DeepseekV41WeightConverter).
         """
         from torchturbo.runtime import get_device_runtime
 
@@ -162,5 +172,7 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
             if isinstance(module, RowShardedEngram):
                 if self._model_path is not None:
                     module.load_table(self._model_path, device)
+                    module.load_params(self._model_path, device)
                 else:
                     module.init_table_random()
+                    module.init_params_random()

@@ -15,10 +15,9 @@ from ...parallel import FSDPParallelPlan, FSDPPlacementSpec, FSDPPlanSpec
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.moe.moe_layer import MoEConfig, MoELayer, MoESubmodules
 
+# v4.1 has no hc_head params (delayed hyper-connections); the engram module
+# is no_shard at module level, so its params are not listed here either.
 _NO_SHARD_PARAM_NAMES = [
-    "hc_head_fn",
-    "hc_head_base",
-    "hc_head_scale",
     "hc_attn_fn",
     "hc_attn_base",
     "hc_attn_scale",
@@ -26,8 +25,6 @@ _NO_SHARD_PARAM_NAMES = [
     "hc_ffn_base",
     "hc_ffn_scale",
     "attn_sink",
-    "q_weight",
-    "k_weight",
 ]
 
 
@@ -141,6 +138,10 @@ def get_parallel_plan(**kwargs) -> FSDPParallelPlan:
             ),
             "layers.*.engram": FSDPPlanSpec(
                 replace_module=_replace_engram_only,
+                # Replicated (wkv/q/k are ~630MiB/rank): plain tensors let
+                # on_materialized load them directly from the giant table
+                # shards, and grads sync through the no_shard AVG hooks.
+                no_shard=True,
             ),
             **{name: FSDPPlanSpec(no_shard=True) for name in _NO_SHARD_PARAM_NAMES},
             **{

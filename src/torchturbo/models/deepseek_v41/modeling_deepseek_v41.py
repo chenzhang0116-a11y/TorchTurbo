@@ -34,8 +34,8 @@ dtype. The indexer auxiliary loss (DSAIndexerLoss in v4) is not ported yet.
 
 Cross-layer tensors (CSA2 shared slots, delayed hc pre-mix) flow between
 per-layer checkpoint regions; this requires NON-REENTRANT activation
-checkpointing (the engine default). kv-source layers additionally publish
-their shared slots outside the checkpointed region for robustness.
+checkpointing (the training backend enables exactly that). kv-source layers
+additionally publish their shared slots outside the checkpointed region.
 """
 
 import json
@@ -288,23 +288,17 @@ def select_candidate_blocks_packed(
 
 
 # ---------------------------------------------------------------------------
-# CSA2 runtime shared across layers of one forward.
+# CSA2 shared slots.
+#
+# The four slot tensors (compressed KV, index K, top-k indices, candidate
+# blocks) flow between layers EXPLICITLY: the model loop resolves them at
+# forward time and passes them as arguments to every layer, so a
+# checkpointed layer recompute replays against the exact same tensors.
+# A mutable shared object would break under reverse-order recomputation
+# (later index sources overwrite slots that earlier layers' recomputes
+# would then misread). kv-source production runs in publish_shared,
+# OUTSIDE the checkpointed region, keeping its autograd graph alive.
 # ---------------------------------------------------------------------------
-
-
-class SharedAttentionRuntime:
-    """Per-forward slots handed down the layer stack (inference's
-    SharedAttentionRuntime, training edition). Sources write before their
-    consumers read; every forward starts from a fresh instance, and
-    ``published`` records layers whose shared tensors were produced outside
-    activation checkpointing (see DecoderLayer.publish_shared)."""
-
-    def __init__(self):
-        self.compress_kv: Optional[torch.Tensor] = None
-        self.index_k: Optional[torch.Tensor] = None
-        self.topk_idxs: Optional[torch.Tensor] = None
-        self.candidates: Optional[torch.Tensor] = None
-        self.published: set = set()
 
 
 # ---------------------------------------------------------------------------
@@ -405,18 +399,35 @@ class DeepseekV41Indexer(nn.Module):
             self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = DeepseekV41RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
+    def compute_index_k(
+        self,
+        latent: torch.Tensor,
+        inv_freq: torch.Tensor,
+        block_positions: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Project this layer's pre-rope latent into shared index keys
+        (kv sources only; the tail rotates at block-start positions)."""
+        k = self.k_norm(self.wk(latent))
+        return _rope_tail(k, inv_freq, block_positions, self.rope_head_dim)
+
+    def score(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
-        latent: Optional[torch.Tensor],
+        index_k: torch.Tensor,
         inv_freq: torch.Tensor,
-        shared: SharedAttentionRuntime,
+        candidates: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         position_ids: torch.LongTensor,
     ):
-        """Return (topk row-block indices [b, s, k] with -1 padding,
-        index_score [b, s, T] for the future indexer aux loss)."""
+        """Score the shared index keys and pick the top-k blocks.
+
+        ``index_k``: the group's shared index keys. ``candidates`` masks
+        scores into the candidate-source block pool when present. Returns
+        (topk row-block indices [b, s, k] with -1 padding, new candidate
+        pool or None, index_score [b, s, T] for the future indexer aux
+        loss).
+        """
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
 
@@ -428,19 +439,11 @@ class DeepseekV41Indexer(nn.Module):
         q = self.wq_b(qr).view(bsz, seqlen, self.n_heads, self.head_dim)
         q = _rope_tail(q, inv_freq, position_ids, rd)
 
-        if self.owns_k:
-            if latent is None:
-                return None, None
-            k = self.k_norm(self.wk(latent))
-            k = _rope_tail(k, inv_freq, block_positions, rd)
-            shared.index_k = k
-        else:
-            k = shared.index_k
-            if k is None or k.size(1) != num_blocks:
-                return None, None
+        if index_k is None or index_k.size(1) != num_blocks:
+            return None, None, None
 
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q, k)
+        index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
         invisible = pu.packed_compress_mask(
@@ -454,8 +457,9 @@ class DeepseekV41Indexer(nn.Module):
             invisible, torch.finfo(index_score.dtype).min, torch.zeros((), dtype=index_score.dtype, device=x.device)
         )
 
+        new_candidates = None
         if self.is_candidate_source:
-            shared.candidates = select_candidate_blocks_packed(
+            new_candidates = select_candidate_blocks_packed(
                 index_score,
                 block_ids,
                 block_positions,
@@ -465,12 +469,16 @@ class DeepseekV41Indexer(nn.Module):
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
             )
-        elif shared.candidates is not None:
-            index_score = index_score.masked_fill(~shared.candidates, torch.finfo(index_score.dtype).min)
+        elif candidates is not None:
+            index_score = index_score.masked_fill(~candidates, torch.finfo(index_score.dtype).min)
 
         topk = min(self.index_topk, num_blocks)
         if topk == 0:
-            return index_score.new_full((bsz, seqlen, 0), -1, dtype=torch.long), index_score
+            return (
+                index_score.new_full((bsz, seqlen, 0), -1, dtype=torch.long),
+                new_candidates,
+                index_score,
+            )
         idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
 
         batch_index = torch.arange(bsz, device=x.device).unsqueeze(1)
@@ -479,7 +487,7 @@ class DeepseekV41Indexer(nn.Module):
         invalid = pu.packed_compress_mask(
             attention_mask, topk_ids, topk_pos, self.compress_ratio, position_ids
         )
-        return torch.where(invalid, -1, idxs), index_score
+        return torch.where(invalid, -1, idxs), new_candidates, index_score
 
     def init_weights(self, _init_std: float):
         for linear in [self.wq_b, self.weights_proj]:
@@ -517,12 +525,20 @@ class DeepseekV41PreAttentionOps(nn.Module):
         wq_b,
         wkv,
         kv_norm,
-        compressor,
         indexer,
-        shared: SharedAttentionRuntime,
+        compress_kv: Optional[torch.Tensor],
+        index_k: Optional[torch.Tensor],
+        topk_idxs: Optional[torch.Tensor],
+        candidates: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         position_ids: torch.LongTensor,
     ):
+        """Returns (q, window kv, window topk, kv_compress, new_topk).
+
+        ``new_topk`` is set only by Reindex layers (index sources without
+        their own compressor): they run the indexer inside this call. All
+        other compressed-KV layers consume the ``topk_idxs`` argument.
+        """
         bsz, seqlen, _ = x.size()
         # Layers with compressed KV rope everything with the compress table
         # (YaRN + compress_rope_theta); pure sliding-window layers use the
@@ -541,37 +557,18 @@ class DeepseekV41PreAttentionOps(nn.Module):
             self.window_size, bsz, seqlen, x.device, attention_mask
         )
 
-        kv_compress = None
-        compress_topk = None
+        new_topk = None
         if self.compress_ratio > 0:
-            if self.layer_idx in shared.published:
-                # Shared tensors were produced outside checkpointing by
-                # publish_shared; just read the slots.
-                kv_compress = shared.compress_kv
-                compress_topk = shared.topk_idxs
+            if indexer is not None:
+                # Reindex layer: score the shared index keys here so the
+                # recomputation is self-contained.
+                new_topk, _, _ = indexer.score(
+                    x, qr, index_k, inv_freq, candidates, attention_mask, position_ids
+                )
             else:
-                latent = None
-                if compressor is not None:
-                    latent = compressor(x, attention_mask, position_ids)
-                if indexer is not None:
-                    compress_topk, _ = indexer(
-                        x, qr, latent, inv_freq, shared, attention_mask, position_ids
-                    )
-                    shared.topk_idxs = compress_topk
-                else:
-                    compress_topk = shared.topk_idxs
-                if latent is not None:
-                    # Rope the latent at its block-start positions and
-                    # publish for this group's consumer layers.
-                    block_ids, block_positions = pu.packed_compress_kv_ids_and_positions(
-                        attention_mask, self.compress_ratio, position_ids
-                    )
-                    kv_compress = _rope_tail(latent, inv_freq, block_positions, rd)
-                    shared.compress_kv = kv_compress
-                else:
-                    kv_compress = shared.compress_kv
+                new_topk = topk_idxs
 
-        return q, kv, window_topk, kv_compress, compress_topk
+        return q, kv, window_topk, compress_kv, new_topk
 
 
 class DeepseekV41InnerAttentionOps(nn.Module):
@@ -738,7 +735,10 @@ class DeepseekV41Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        shared: SharedAttentionRuntime,
+        compress_kv: Optional[torch.Tensor],
+        index_k: Optional[torch.Tensor],
+        topk_idxs: Optional[torch.Tensor],
+        candidates: Optional[torch.Tensor],
         attention_mask: torch.Tensor = None,
         position_ids: torch.LongTensor = None,
         **kwargs,
@@ -746,10 +746,16 @@ class DeepseekV41Attention(nn.Module):
         bsz, seqlen, _ = hidden_states.size()
         self._ensure_inv_freq(hidden_states.device)
 
-        compressor = self.compressor if self.is_kv_source else None
-        indexer = self.indexer if self.is_index_source else None
+        # Only Reindex layers (index source without their own compressor)
+        # run the indexer inside the layer; kv sources got their top-k from
+        # publish_shared.
+        indexer = (
+            self.indexer
+            if self.is_index_source and not self.is_kv_source
+            else None
+        )
 
-        q, kv, window_topk, kv_compress, compress_topk = self.pre_attention_ops(
+        q, kv, window_topk, kv_compress, new_topk = self.pre_attention_ops(
             hidden_states,
             self.inv_freq_plain,
             self.inv_freq_yarn,
@@ -758,21 +764,28 @@ class DeepseekV41Attention(nn.Module):
             self.wq_b,
             self.wkv,
             self.kv_norm,
-            compressor,
             indexer,
-            shared,
+            compress_kv,
+            index_k,
+            topk_idxs,
+            candidates,
             attention_mask,
             position_ids,
         )
 
         o = self.inner_attention_ops(
-            q, kv, window_topk, kv_compress, compress_topk, self.attn_sink
+            q,
+            kv,
+            window_topk,
+            kv_compress,
+            new_topk if new_topk is not None else topk_idxs,
+            self.attn_sink,
         )
 
         inv_freq = self.inv_freq_yarn if self.compress_ratio > 0 else self.inv_freq_plain
         # Groups shrink when SP splits heads; SP=1 keeps all of them.
         n_local_groups = self.n_groups // (self.n_heads // q.shape[2])
-        return self.post_attention_ops(
+        attn_output = self.post_attention_ops(
             o,
             inv_freq,
             position_ids,
@@ -782,6 +795,7 @@ class DeepseekV41Attention(nn.Module):
             self.wo_a,
             self.wo_b,
         )
+        return attn_output, new_topk
 
     def init_weights(self, init_std: float):
         for linear in [self.wq_a, self.wq_b, self.wkv, self.wo_a, self.wo_b]:
@@ -1128,6 +1142,45 @@ class RowShardedEngram(DeepseekV41Engram):
             local[row_end - row_start :].zero_()
         self.table = local
 
+    def load_params(self, model_path: str, device=None):
+        """Load wkv/q_weight/k_weight straight from their checkpoint shard.
+
+        These params share the giant engram shard files with the tables, so
+        the generic loader must not touch those files (it would load_file()
+        a whole 197GiB shard for a 315MiB tensor): the weight converter
+        skips them and this method reads just the three tensors. The module
+        is no_shard, so the params are plain replicated tensors and a
+        direct copy_ is safe.
+        """
+        if device is None:
+            from torchturbo.runtime import get_device_runtime
+
+            device = get_device_runtime().device
+        index_path = Path(model_path) / "model.safetensors.index.json"
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        targets = {
+            "wkv.weight": self.wkv.weight,
+            "q_weight": self.q_weight,
+            "k_weight": self.k_weight,
+        }
+        by_file: dict = {}
+        for suffix, param in targets.items():
+            key = f"layers.{self.layer_idx}.engram.{suffix}"
+            by_file.setdefault(weight_map[key], []).append((key, param))
+        for filename, items in by_file.items():
+            with safe_open(Path(model_path) / filename, framework="pt") as f:
+                for key, param in items:
+                    param.data.copy_(
+                        f.get_tensor(key).to(device=param.device, dtype=param.dtype)
+                    )
+
+    def init_params_random(self):
+        """Fallback for train-from-scratch runs without a checkpoint."""
+        nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=0.02)
+        nn.init.ones_(self.q_weight)
+        nn.init.ones_(self.k_weight)
+
     def init_table_random(self):
         """Fallback for train-from-scratch runs without a checkpoint."""
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -1308,46 +1361,62 @@ class DeepseekV41DecoderLayer(nn.Module):
     def publish_shared(
         self,
         hidden_states: torch.Tensor,
-        shared: SharedAttentionRuntime,
         pre_mix: torch.Tensor,
+        compress_kv: Optional[torch.Tensor],
+        index_k: Optional[torch.Tensor],
+        topk_idxs: Optional[torch.Tensor],
+        candidates: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         position_ids: torch.LongTensor,
     ):
-        """Run the compressor + indexer OUTSIDE activation checkpointing.
+        """Produce this kv source's shared slots OUTSIDE activation
+        checkpointing.
 
-        The shared tensors (compressed KV, index K) are consumed by later
-        layers, so their autograd graph must stay alive; a checkpointed
-        publish would orphan it (re-entrant mode) or force a region
-        recompute mid-backward. Cheap relative to the layer itself.
+        Returns the updated (compress_kv, index_k, topk_idxs, candidates)
+        tuple; the caller threads it into the layer call as explicit
+        arguments, so checkpointed recomputes replay against exactly these
+        tensors and the cross-layer autograd graph stays alive.
         """
         if not self.is_kv_source:
-            return
+            return compress_kv, index_k, topk_idxs, candidates
         attn = self.attn
         attn._ensure_inv_freq(hidden_states.device)
         x = collapse_hc(hidden_states, pre_mix)
         x = self.attn_norm(x)
         latent = attn.compressor(x, attention_mask, position_ids)
         inv_freq = attn.inv_freq_yarn
-        if attn.is_index_source:
-            qr = attn.q_norm(attn.wq_a(x))
-            topk, _ = attn.indexer(
-                x, qr, latent, inv_freq, shared, attention_mask, position_ids
-            )
-            shared.topk_idxs = topk
         if latent is not None:
             block_ids, block_positions = pu.packed_compress_kv_ids_and_positions(
                 attention_mask, attn.compress_ratio, position_ids
             )
-            shared.compress_kv = _rope_tail(
+            compress_kv = _rope_tail(
                 latent, inv_freq, block_positions, attn.rope_head_dim
             )
-        shared.published.add(self.layer_idx)
+            if attn.indexer is not None and attn.indexer.owns_k:
+                index_k = attn.indexer.compute_index_k(latent, inv_freq, block_positions)
+        else:
+            # No complete block in this group: consumers fall back to
+            # window-only attention.
+            compress_kv = None
+        if attn.is_index_source:
+            qr = attn.q_norm(attn.wq_a(x))
+            topk, new_candidates, _ = attn.indexer.score(
+                x, qr, index_k, inv_freq, candidates, attention_mask, position_ids
+            )
+            if topk is not None:
+                topk_idxs = topk
+            if new_candidates is not None:
+                candidates = new_candidates
+        return compress_kv, index_k, topk_idxs, candidates
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        shared: SharedAttentionRuntime,
         pre_mix: torch.Tensor,
+        compress_kv: Optional[torch.Tensor],
+        index_k: Optional[torch.Tensor],
+        topk_idxs: Optional[torch.Tensor],
+        candidates: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         engram_hashes: Optional[torch.Tensor] = None,
@@ -1371,7 +1440,15 @@ class DeepseekV41DecoderLayer(nn.Module):
         )
         hidden_states = collapse_hc(hidden_states, pre_mix)
         hidden_states = self.attn_norm(hidden_states)
-        attn_output = self.attn(hidden_states, shared, attention_mask, position_ids)
+        attn_output, new_topk = self.attn(
+            hidden_states,
+            compress_kv,
+            index_k,
+            topk_idxs,
+            candidates,
+            attention_mask,
+            position_ids,
+        )
         hidden_states = self.hc_post(attn_output, residual, attn_post, attn_comb)
 
         # FFN sublayer: the ffn pre-mix becomes the next layer's attention
@@ -1384,7 +1461,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.ffn(hidden_states)
         hidden_states = self.hc_post(hidden_states, residual, ffn_post, ffn_comb)
-        return hidden_states, ffn_pre
+        return hidden_states, ffn_pre, new_topk
 
     def init_weights(self, init_std: float):
         for norm in [self.attn_norm, self.ffn_norm]:
@@ -1681,28 +1758,42 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
         pre_mix = make_identity_pre_mix(hidden_states, hc_mult)
 
         all_hidden_states = () if output_hidden_states else None
-        shared = SharedAttentionRuntime()
+        # CSA2 slots threaded explicitly: (compress_kv, index_k, topk,
+        # candidates). kv sources refresh them in publish_shared (outside
+        # any checkpoint); Reindex layers refresh topk via their return
+        # value. Checkpointed layers receive the slots as arguments, so
+        # recomputes replay against identical tensors.
+        slots = (None, None, None, None)
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # kv-source layers always publish their shared tensors before the
-            # layer call: the engine owns activation checkpointing (it wraps
-            # whole layers via the parallel plan), and a checkpointed layer
-            # would otherwise orphan the cross-layer shared autograd graph.
             if decoder_layer.is_kv_source:
-                decoder_layer.publish_shared(
-                    hidden_states, shared, pre_mix, attention_mask, position_ids
+                slots = decoder_layer.publish_shared(
+                    hidden_states, pre_mix, *slots, attention_mask, position_ids
                 )
-            hidden_states, pre_mix = decoder_layer(
-                hidden_states,
-                shared,
-                pre_mix,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                engram_hashes=engram_hashes,
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states, pre_mix, new_topk = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    pre_mix,
+                    *slots,
+                    attention_mask,
+                    position_ids,
+                    engram_hashes,
+                )
+            else:
+                hidden_states, pre_mix, new_topk = decoder_layer(
+                    hidden_states,
+                    pre_mix,
+                    *slots,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    engram_hashes=engram_hashes,
+                )
+            if new_topk is not None:
+                slots = (slots[0], slots[1], new_topk, slots[3])
 
         # Final collapse with the last layer's ffn pre-mix (delayed HC), then
         # norm + fp32 projection.
