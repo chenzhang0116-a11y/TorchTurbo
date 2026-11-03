@@ -23,8 +23,9 @@ v4.1-specific mechanisms implemented here:
 - Engram conditional memory: the n-gram hash is computed from ``input_ids``
   inside the forward (deterministic buffers, no learned parameters). The
   full-table ``DeepseekV41Engram`` is the HF/reference variant;
-  ``RowShardedEngram`` (built by the parallel plan) holds a per-rank row
-  slice as a plain tensor so the 2x183GiB tables never enter FSDP.
+  ``HostOffloadEngram`` (built by the parallel plan) keeps the table on the
+  host, EP-sharded, with only the requested rows fetched per lookup
+  (FSDPTurbo PR100 design).
 
 Deliberate differences vs deepseek_v4 modeling: delayed hyper-connections
 (coefficient sets apply one sublayer later; no learned hc_head parameters),
@@ -60,6 +61,7 @@ from ..deepseek_v4.modeling_deepseek_v4 import (
 )
 from ..deepseek_v4 import packing_utils as pu
 from .configuration_deepseek_v41 import DeepseekV41Config
+from .host_offload_embedding import TorchHostOffloadEmbedding
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +445,10 @@ class DeepseekV41Indexer(nn.Module):
             return None, None, None
 
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q, index_k)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        # Index scores in FP32 so the top-k decisions are numerically stable
+        # (FSDPTurbo reference: bf16 ties would flip block selection).
+        index_score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
+        index_score = (index_score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)
 
         invisible = pu.packed_compress_mask(
             attention_mask,
@@ -453,9 +457,7 @@ class DeepseekV41Indexer(nn.Module):
             self.compress_ratio,
             position_ids,
         )
-        index_score = index_score + torch.where(
-            invisible, torch.finfo(index_score.dtype).min, torch.zeros((), dtype=index_score.dtype, device=x.device)
-        )
+        index_score = index_score.masked_fill(invisible, float("-inf"))
 
         new_candidates = None
         if self.is_candidate_source:
@@ -470,7 +472,7 @@ class DeepseekV41Indexer(nn.Module):
                 self.candidate_block_size,
             )
         elif candidates is not None:
-            index_score = index_score.masked_fill(~candidates, torch.finfo(index_score.dtype).min)
+            index_score = index_score.masked_fill(~candidates, float("-inf"))
 
         topk = min(self.index_topk, num_blocks)
         if topk == 0:
@@ -572,7 +574,16 @@ class DeepseekV41PreAttentionOps(nn.Module):
 
 
 class DeepseekV41InnerAttentionOps(nn.Module):
-    """Sparse attention over window KV plus (optionally) compressed KV."""
+    """Indexed sparse attention over the selected KV positions.
+
+    Port of FSDPTurbo's eager ``indexed_sparse_attention`` (the gather-based
+    small operator): only the top-k selected keys are gathered per query, so
+    the score tensor is [b, s, h, k] instead of a dense [b, h, s, kv_len].
+    Scores upcast to fp32, the attention sink joins the softmax as one extra
+    fp32 column, and probabilities drop back to the KV dtype for the output
+    einsum. Validity is fully encoded by -1 indices (packed semantics); no
+    extra attention mask branch is needed.
+    """
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -588,44 +599,38 @@ class DeepseekV41InnerAttentionOps(nn.Module):
         compress_topk: Optional[torch.Tensor],
         attn_sink: torch.Tensor,
     ):
-        bsz, seqlen, n_heads, head_dim = q.size()
-
         if kv_compress is not None and compress_topk is not None:
-            offset = kv.size(1)
-            topk_idxs = torch.cat(
-                [window_topk, compress_topk + offset], dim=-1
-            ).int()
+            # Shift the compressed block indices past the window KV.
+            compress_topk = torch.where(
+                compress_topk >= 0, compress_topk + kv.size(1), compress_topk
+            )
+            topk_idxs = torch.cat([window_topk, compress_topk], dim=-1)
             kv_states = torch.cat([kv, kv_compress], dim=1)
         else:
-            topk_idxs = window_topk.int()
+            topk_idxs = window_topk
             kv_states = kv
 
-        q_t = q.transpose(1, 2)  # [b, h, s, d]
-        attn_weights = torch.matmul(q_t, kv_states.unsqueeze(1).transpose(2, 3))
-        attn_weights = attn_weights * self.softmax_scale
-
-        # +1 column for the attention sink; kv_states is [b, kv_len, d].
-        index_mask = torch.full(
-            (bsz, 1, seqlen, kv_states.size(1) + 1),
-            fill_value=torch.finfo(attn_weights.dtype).min,
-            dtype=attn_weights.dtype,
-            device=q.device,
+        bsz, seqlen, n_heads, head_dim = q.shape
+        topk_size = topk_idxs.shape[-1]
+        safe_indices = topk_idxs.clamp_min(0).long()
+        expanded_kv = kv_states.unsqueeze(1).expand(-1, seqlen, -1, -1)
+        selected_kv = torch.gather(
+            expanded_kv,
+            2,
+            safe_indices.unsqueeze(-1).expand(bsz, seqlen, topk_size, head_dim),
         )
-        valid_mask = topk_idxs >= 0
-        if valid_mask.any():
-            b_indices, s_indices, k_indices = torch.where(valid_mask)
-            valid_topk = topk_idxs[b_indices, s_indices, k_indices]
-            index_mask[b_indices, 0, s_indices, valid_topk] = 0
-        attn_weights = attn_weights + index_mask[..., :-1]
 
-        sinks = attn_sink.reshape(1, -1, 1, 1).to(attn_weights.dtype)
-        sinks = sinks.expand(bsz, -1, seqlen, -1)
-        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
-        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        scores = (
+            torch.einsum("bshd,bskd->bshk", q, selected_kv).float() * self.softmax_scale
+        )
+        scores = scores.masked_fill(topk_idxs.unsqueeze(2) < 0, float("-inf"))
 
-        probs = F.softmax(combined_logits.float(), dim=-1, dtype=attn_weights.dtype)
-        attn_output = torch.matmul(probs[..., :-1], kv_states)  # [b, h, s, d]
-        return attn_output.transpose(1, 2).contiguous()
+        sink = attn_sink.float().view(1, 1, -1, 1).expand(bsz, seqlen, -1, -1)
+        probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
+        output = torch.einsum(
+            "bshk,bskd->bshd", probs.to(selected_kv.dtype), selected_kv
+        )
+        return output.to(q.dtype)
 
 
 class DeepseekV41PostAttentionOps(nn.Module):
@@ -937,7 +942,9 @@ class NgramHashState(nn.Module):
         self.compressed_vocab_size = text_config.engram_compressed_vocab_size
         self.engram_vocab_size = text_config.engram_vocab_size
         self.vocab_size = text_config.vocab_size
+        self._num_embeddings = list(text_config.engram_num_embeddings)
         self._top_config = top_config
+        self.hash_fingerprint: Optional[str] = None
 
         self.register_buffer("token_map", None, persistent=False)
         self.register_buffer("multipliers", None, persistent=False)
@@ -951,6 +958,8 @@ class NgramHashState(nn.Module):
     def build(self, device: torch.device, model_path: Optional[str] = None):
         if self.token_map is not None:
             return
+        import hashlib
+
         from transformers import AutoTokenizer
 
         path = model_path or getattr(self._top_config, "_name_or_path", None)
@@ -969,9 +978,19 @@ class NgramHashState(nn.Module):
                 f"rehashed. Check the tokenizer against the checkpoint."
             )
 
+        # Layout validation (FSDPTurbo reference): layer ids must be unique
+        # and the tables must cover every prime bucket range.
+        if len(set(self.layer_ids)) != len(self.layer_ids):
+            raise ValueError("engram layer ids must be unique.")
+
         primes = _build_engram_primes(
             len(self.layer_ids), self.max_ngram_size, self.n_heads, self.engram_vocab_size
         )
+        for rows, layer_primes in zip(self._num_embeddings, primes.tolist()):
+            if rows < sum(sum(heads) for heads in layer_primes):
+                raise ValueError(
+                    "engram table rows do not cover the generated hash bucket ranges."
+                )
         multipliers = _compute_engram_multipliers(
             self.layer_ids, self.max_ngram_size, compressed_vocab_size
         )
@@ -984,6 +1003,15 @@ class NgramHashState(nn.Module):
             for size in flat_sizes[:-1]:
                 starts.append(starts[-1] + size)
             offsets.append(starts)
+
+        # Integrity fingerprint over the full hash ABI (token map + bucket
+        # layout + multipliers): a tokenizer revision change rehashes every
+        # row id while keeping shapes valid, so shape checks cannot catch it.
+        self.hash_fingerprint = hashlib.sha256(
+            torch.tensor(token_map, dtype=torch.int64).numpy().tobytes()
+            + primes.numpy().tobytes()
+            + multipliers.numpy().tobytes()
+        ).hexdigest()
 
         self.token_map = torch.tensor(token_map, dtype=torch.int64).to(device)
         self.multipliers = multipliers.to(device)
@@ -1031,7 +1059,7 @@ class DeepseekV41Engram(nn.Module):
     """Gated n-gram lookup written into the residual stream.
 
     The full-table variant used by the HF/reference path; the training path
-    swaps in RowShardedEngram (same param names, row-sharded table).
+    swaps in HostOffloadEngram (same param names, host-offloaded table).
     """
 
     def __init__(self, text_config, layer_idx: int, layer_hash_index: int):
@@ -1060,7 +1088,8 @@ class DeepseekV41Engram(nn.Module):
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor) -> torch.Tensor:
         """x: [b, s, hc, dim]; hash_ids: [b, s, n_hash_cols]."""
-        kv = self.wkv(self._embed_lookup(hash_ids).flatten(-2))
+        memory = self._embed_lookup(hash_ids).flatten(-2).to(x.dtype)
+        kv = self.wkv(memory)
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         weight = self.q_weight.float() * self.k_weight.float()
@@ -1070,10 +1099,10 @@ class DeepseekV41Engram(nn.Module):
             key.square().mean(-1) + self.eps
         )
         dot = (h * weight * key).sum(-1) * rstd * self.dim ** -0.5
-        # Signed sqrt before the sigmoid, matching the training kernel.
-        gate = torch.sigmoid(
-            torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot)
-        )
+        # Signed sqrt before the sigmoid, matching the training kernel; the
+        # where-form avoids copysign (NPU portability, FSDPTurbo reference).
+        magnitude = dot.abs().clamp_min(self.clamp_value).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
     def init_weights(self, _init_std: float):
@@ -1083,64 +1112,43 @@ class DeepseekV41Engram(nn.Module):
         nn.init.ones_(self.k_weight)
 
 
-class RowShardedEngram(DeepseekV41Engram):
-    """Training-path engram with the table row-sharded across ranks.
+class HostOffloadEngram(DeepseekV41Engram):
+    """Training-path engram with the table host-offloaded (FSDPTurbo PR100).
 
-    The table is a plain tensor attribute (NOT an nn.Parameter): FSDP2 would
-    all-gather a 183GiB parameter on every forward, and the generic weight
-    loader broadcasts full tensors, so the shard is read directly from the
-    safetensors file via ``load_table``. Lookup masks out-of-shard rows and
-    all_reduces, so each hash id is summed exactly once (frozen phase 1:
-    no gradient synchronization is involved).
+    The table lives on the host, sharded over the EP group inside a
+    TorchHostOffloadEmbedding; only the requested rows cross to the device
+    (routed by all_to_all, gradients return as sparse COO). The remaining
+    params (wkv/q_weight/k_weight) stay ordinary NPU params: they share the
+    giant table shard files, so the weight converter skips them and the
+    wrapper loads them via load_params.
     """
 
-    def __init__(self, text_config, layer_idx: int, layer_hash_index: int):
+    def __init__(self, text_config, layer_idx: int, layer_hash_index: int, ep_group=None):
         super().__init__(text_config, layer_idx, layer_hash_index)
         del self.embed  # full table never materializes on the training path
-        self.table: Optional[torch.Tensor] = None
+        n_hash_cols = (text_config.engram_max_ngram_size - 1) * text_config.engram_n_heads
+        # Capacity covers a full packed micro-batch of lookups.
+        max_packed_tokens = 131072
+        self.embed = TorchHostOffloadEmbedding(
+            text_config.engram_num_embeddings[layer_hash_index],
+            text_config.engram_head_dim,
+            layer_id=layer_idx,
+            num_max_tokens_per_rank=max_packed_tokens * n_hash_cols,
+            pin_memory=True,
+        )
         self.table_key = f"layers.{layer_idx}.engram.embed.weight"
-        self.num_rows = text_config.engram_num_embeddings[layer_hash_index]
-        self.head_dim = text_config.engram_head_dim
+        self.ep_group = ep_group
 
-    def init_weights(self, init_std: float):
-        # No self.embed here; the table comes from load_table/init_table_random.
-        nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=0.02)
-        nn.init.ones_(self.q_weight)
-        nn.init.ones_(self.k_weight)
-
-    def load_table(self, model_path: str, device=None, group=dist.group.WORLD):
-        """Read this rank's row slice from the checkpoint shard by shard.
-
-        The table lives on the compute device (frozen, resident); slices are
-        streamed in ~512MiB chunks so neither host nor device ever holds the
-        full table.
-        """
-        from torchturbo.runtime import get_device_runtime
-
-        if device is None:
-            device = get_device_runtime().device
-        world_size = dist.get_world_size(group)
-        rank = dist.get_rank(group)
-        shard_rows = math.ceil(self.num_rows / world_size)
-        row_start = rank * shard_rows
-        row_end = min(row_start + shard_rows, self.num_rows)
-
-        index_path = Path(model_path) / "model.safetensors.index.json"
-        with open(index_path) as f:
-            filename = json.load(f)["weight_map"][self.table_key]
-
-        local = torch.empty(shard_rows, self.head_dim, dtype=torch.bfloat16, device=device)
-        chunk_rows = max(1, (1 << 29) // (self.head_dim * 2))
-        with safe_open(Path(model_path) / filename, framework="pt") as f:
-            table_slice = f.get_slice(self.table_key)
-            for start in range(row_start, row_end, chunk_rows):
-                end = min(start + chunk_rows, row_end)
-                local[start - row_start : end - row_start] = table_slice[start:end].to(
-                    device
-                )
-        if row_end - row_start < shard_rows:
-            local[row_end - row_start :].zero_()
-        self.table = local
+    def materialize(self, ep_group=None):
+        """Materialize the owner-local CPU shard on the EP group."""
+        group = ep_group or self.ep_group
+        if group is None:
+            raise RuntimeError(
+                f"HostOffloadEngram {self.table_key} has no EP group; pass one "
+                "to materialize()."
+            )
+        self.embed.shard_(group)
+        return self
 
     def load_params(self, model_path: str, device=None):
         """Load wkv/q_weight/k_weight straight from their checkpoint shard.
@@ -1148,9 +1156,7 @@ class RowShardedEngram(DeepseekV41Engram):
         These params share the giant engram shard files with the tables, so
         the generic loader must not touch those files (it would load_file()
         a whole 197GiB shard for a 315MiB tensor): the weight converter
-        skips them and this method reads just the three tensors. The module
-        is no_shard, so the params are plain replicated tensors and a
-        direct copy_ is safe.
+        skips them and this method reads just the three tensors.
         """
         if device is None:
             from torchturbo.runtime import get_device_runtime
@@ -1181,66 +1187,42 @@ class RowShardedEngram(DeepseekV41Engram):
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
 
-    def init_table_random(self):
-        """Fallback for train-from-scratch runs without a checkpoint."""
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        shard_rows = math.ceil(self.num_rows / world_size)
-        device = next(self.parameters()).device
-        table = torch.empty(shard_rows, self.head_dim, dtype=torch.float32, device=device)
-        nn.init.trunc_normal_(table, mean=0.0, std=0.02)
-        self.table = table.to(torch.bfloat16)
-
     def _embed_lookup(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        if self.table is None:
-            raise RuntimeError(
-                f"RowShardedEngram table not loaded for {self.table_key}; "
-                f"call load_table() (the Turbo wrapper does this in "
-                f"on_materialized)."
-            )
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        shard_rows = self.table.size(0)
-        row_start = dist.get_rank() * shard_rows if dist.is_initialized() else 0
-        mask = (hash_ids < row_start) | (hash_ids >= row_start + shard_rows)
-        local = (hash_ids - row_start).masked_fill(mask, 0)
-        values = F.embedding(local, self.table)
-        values = values.masked_fill(mask.unsqueeze(-1), 0)
-        if world_size > 1:
-            dist.all_reduce(values)
-        return values
+        return self.embed(hash_ids)
 
-
-# ---------------------------------------------------------------------------
-# MoE (HF/reference path; the training path replaces ffn with MoELayer).
-# ---------------------------------------------------------------------------
 
 
 class DeepseekV41Gate(nn.Module):
     """noaux_tc gating: the bias steers selection only; routing weights come
-    from the unbiased scores. bias_vl (image-span routing bias) is loaded
-    from the checkpoint but only consumed on multimodal inputs."""
+    from the unbiased scores. bias and bias_vl are trainable fp32 parameters
+    (FSDPTurbo reference); bias_vl is consumed on multimodal inputs only.
+
+    The engine training path swaps this module for MoELayer, whose router
+    keeps expert_bias as a persistent buffer (torchturbo convention).
+    """
 
     def __init__(self, text_config, vision_enabled: bool):
         super().__init__()
         self.topk = text_config.num_experts_per_tok
         self.score_func = text_config.scoring_func
+        self.gate_temp = getattr(text_config, "gate_temp", 1.0)
         self.norm_topk_prob = text_config.norm_topk_prob
         self.route_scale = text_config.routed_scaling_factor
 
         self.weight = nn.Parameter(
             torch.empty(text_config.n_routed_experts, text_config.hidden_size)
         )
-        self.register_buffer(
-            "bias", torch.zeros(text_config.n_routed_experts, dtype=torch.float32)
-        )
+        self.bias = nn.Parameter(torch.empty(text_config.n_routed_experts, dtype=torch.float32))
         if vision_enabled:
-            self.register_buffer(
-                "bias_vl", torch.zeros(text_config.n_routed_experts, dtype=torch.float32)
+            self.bias_vl = nn.Parameter(
+                torch.empty(text_config.n_routed_experts, dtype=torch.float32)
             )
         else:
             self.bias_vl = None
 
-    def forward(self, hidden_states: torch.Tensor):
-        scores = F.linear(hidden_states.float(), self.weight.float())
+    def forward(self, hidden_states: torch.Tensor, image_mask: Optional[torch.Tensor] = None):
+        """x: [n, dim]; image_mask: [n] bool, True for tokens inside an image span."""
+        scores = F.linear(hidden_states.float(), self.weight.float()) / self.gate_temp
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
@@ -1248,7 +1230,12 @@ class DeepseekV41Gate(nn.Module):
         else:  # sqrtsoftplus
             scores = F.softplus(scores).sqrt()
 
-        indices = (scores + self.bias).topk(self.topk, dim=-1)[1]
+        bias = self.bias
+        if image_mask is not None and self.bias_vl is not None:
+            bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
+        # the bias picks experts but does not scale them: weights come from
+        # the raw scores
+        indices = (scores + bias).topk(self.topk, dim=-1)[1]
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -1256,6 +1243,9 @@ class DeepseekV41Gate(nn.Module):
 
     def init_weights(self, _init_std: float):
         nn.init.trunc_normal_(self.weight, mean=0.0, std=_init_std)
+        nn.init.zeros_(self.bias)
+        if self.bias_vl is not None:
+            nn.init.zeros_(self.bias_vl)
 
 
 class DeepseekV41Expert(nn.Module):
@@ -1624,7 +1614,7 @@ class DeepseekV41PreTrainedModel(PreTrainedModel):
             module.init_weights(std)
         elif isinstance(module, DeepseekV41Head):
             module.init_weights(std)
-        elif isinstance(module, (DeepseekV41Engram, RowShardedEngram)):
+        elif isinstance(module, DeepseekV41Engram):
             module.init_weights(std)
         elif isinstance(module, DeepseekV41RMSNorm):
             module.weight.data.fill_(1.0)

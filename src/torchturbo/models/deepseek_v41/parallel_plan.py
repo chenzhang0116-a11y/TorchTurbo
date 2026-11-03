@@ -2,9 +2,10 @@
 
 Mirrors the deepseek_v4 plan (MoE replacement + EP-sharded experts) and adds
 the engram replacement: the full-table ``DeepseekV41Engram`` becomes a
-``RowShardedEngram`` whose table is a plain per-rank tensor, so the
-2x183GiB tables never enter FSDP2 (a sharded parameter would be all-gathered
-on every forward) nor the generic weight loader (full-tensor broadcasts).
+``HostOffloadEngram`` whose table stays on the host (EP-sharded, rows
+fetched on demand), so the 2x183GiB tables never enter FSDP2 (a sharded
+parameter would be all-gathered on every forward) nor the generic weight
+loader (full-tensor broadcasts).
 """
 
 from typing import Any
@@ -108,14 +109,15 @@ def _replace_engram_only(
     engine_config,
     **kwargs,
 ):
-    from .modeling_deepseek_v41 import DeepseekV41Engram, RowShardedEngram
+    from .modeling_deepseek_v41 import DeepseekV41Engram, HostOffloadEngram
 
     if not isinstance(original_module, DeepseekV41Engram):
         return original_module
-    return RowShardedEngram(
+    return HostOffloadEngram(
         _text_config_of(hf_config),
         original_module.layer_idx,
         original_module.layer_hash_index,
+        ep_group=ep_info["ep_group"],
     )
 
 
@@ -138,9 +140,12 @@ def get_parallel_plan(**kwargs) -> FSDPParallelPlan:
             ),
             "layers.*.engram": FSDPPlanSpec(
                 replace_module=_replace_engram_only,
-                # Replicated (wkv/q/k are ~630MiB/rank): plain tensors let
-                # on_materialized load them directly from the giant table
-                # shards, and grads sync through the no_shard AVG hooks.
+                # The host-offload table is a CPU parameter and wkv/q/k read
+                # their shard manually, so the whole module stays out of
+                # FSDP; grads (once unfrozen) sync through the no_shard AVG
+                # hooks for wkv/q/k and the table's own sparse path.
+                # NOTE: engine cpu_offload FULL would try to move the host
+                # table back to the device (unsupported combination).
                 no_shard=True,
             ),
             **{name: FSDPPlanSpec(no_shard=True) for name in _NO_SHARD_PARAM_NAMES},

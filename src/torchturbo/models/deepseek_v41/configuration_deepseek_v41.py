@@ -51,6 +51,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         n_shared_experts=1,
         num_experts_per_tok=6,
         scoring_func="sqrtsoftplus",
+        gate_temp=1.0,
         topk_method="noaux_tc",
         norm_topk_prob=True,
         routed_scaling_factor=1.5,
@@ -127,6 +128,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         self.n_shared_experts = n_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.scoring_func = scoring_func
+        self.gate_temp = gate_temp
         self.topk_method = topk_method
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor

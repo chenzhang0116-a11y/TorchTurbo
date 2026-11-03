@@ -9,7 +9,7 @@ from ..base import ParameterGroup, TurboVLMModel
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
 from .configuration_deepseek_v41 import DeepseekV41Config
-from .modeling_deepseek_v41 import DeepseekV41ForCausalLM, RowShardedEngram
+from .modeling_deepseek_v41 import DeepseekV41ForCausalLM, HostOffloadEngram
 
 
 class DeepseekV41WeightConverter(BaseWeightConverter):
@@ -41,7 +41,7 @@ class DeepseekV41WeightConverter(BaseWeightConverter):
     def get_param_load_entries(self, name, numel, param_to_filename=None):
         # Engram params sit in the 197GiB table shards; loading them through
         # the generic path would materialize whole shards on the host.
-        # RowShardedEngram loads them itself in on_materialized (the parallel
+        # HostOffloadEngram loads them itself in on_materialized (the parallel
         # plan always swaps the engram modules on the engine path).
         if ".engram." in name:
             return [], None, {}
@@ -158,10 +158,12 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
     def on_materialized(self):
         """Build engram runtime state after parameters are on a real device.
 
-        The n-gram hash buffers need the tokenizer; the row-sharded engram
-        tables AND their sibling params are read straight from the checkpoint
-        shards (the params share the 197GiB table files, so the generic
-        loader skips them entirely - see DeepseekV41WeightConverter).
+        Host-offload tables materialize their owner-local CPU shard on the
+        EP group and stream the rows in from the checkpoint; the sibling
+        params (wkv/q/k) share the giant table shard files, so they are read
+        here too (the converter skips them - see
+        DeepseekV41WeightConverter). Phase 1 freezes the tables; the sparse
+        gradient machinery stays wired for the ActiveRowAdam follow-up.
         """
         from torchturbo.runtime import get_device_runtime
 
@@ -169,10 +171,14 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         if self.engram_hash is not None:
             self.engram_hash.build(device, self._model_path)
         for module in self.modules():
-            if isinstance(module, RowShardedEngram):
+            if isinstance(module, HostOffloadEngram):
+                module.materialize()
                 if self._model_path is not None:
-                    module.load_table(self._model_path, device)
+                    module.embed.load_rows(self._model_path, module.table_key)
                     module.load_params(self._model_path, device)
                 else:
-                    module.init_table_random()
+                    module.embed.init_rows_random()
                     module.init_params_random()
+                module.embed.freeze()
+                if self.engram_hash is not None:
+                    module.embed.hash_fingerprint = self.engram_hash.hash_fingerprint
